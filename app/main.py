@@ -85,14 +85,15 @@ async def startup_event():
 async def root():
     return {
         "message": "TikTok View Crawler API", 
-        "version": "2.4.0",
-        "mode": "Playwright + Google Sheets + Lark Bitable + Deduplication",
+        "version": "3.2.0",
+        "mode": "Playwright v3.2 + Google Sheets + Lark Bitable + Date Filter",
         "features": [
-            "Direct TikTok scraping via Playwright",
-            "Published date extraction",
-            "Automatic fallback to Lark data",
-            "Duplicate prevention",
-            "Background job processing",
+            "Playwright v3.2 with stealth",
+            "Date filter (current + previous month only)",
+            "Broken link detection",
+            "Crash loop protection",
+            "Firefox fallback retry",
+            "Publish date priority (Sheets → Lark → crawl)",
             "Timestamp migration support"
         ]
     }
@@ -421,7 +422,7 @@ async def debug_info():
             "crawler_initialized": crawler is not None,
             "playwright_available": crawler.use_playwright if crawler else False
         },
-        "version": "2.4.0",
+        "version": "3.2.0",
         "timestamp": datetime.now().isoformat()
     }
 

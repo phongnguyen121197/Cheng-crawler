@@ -1,103 +1,335 @@
-"""
-🚀 OPTIMIZED TikTok Crawler - FIXED VERSION
-============================================
-Fixed async handling for FastAPI compatibility
-Better error handling and logging
-"""
-
 import logging
 from typing import List, Dict, Optional
-from datetime import datetime
+from datetime import datetime, date
+
+# Import Playwright crawler
+try:
+    from app.playwright_crawler import TikTokPlaywrightCrawler
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logging.warning("⚠️ Playwright not available, will use Lark data fallback only")
 
 logger = logging.getLogger(__name__)
 
-# Import optimized Playwright crawler
-try:
-    from app.playwright_crawler import TikTokPlaywrightCrawler, CrawlerConfig
-    PLAYWRIGHT_AVAILABLE = True
-    logger.info("✅ Playwright crawler module imported successfully")
-except ImportError as e:
-    PLAYWRIGHT_AVAILABLE = False
-    logger.warning(f"⚠️ Playwright not available: {e}")
-
-
 class TikTokCrawler:
     """
-    TikTok Crawler with OPTIMIZED batch processing
-    FIXED: Better error handling and logging
+    TikTok Crawler v3.2 with Playwright integration
+    NOW WITH PUBLISH DATE PRIORITY! 📅
+    - Preserves existing publish_date if already set
+    - Clears data for broken/unavailable links
     """
     
     def __init__(self, lark_client, sheets_client, use_playwright=True):
+        """
+        Initialize crawler with Lark and Sheets clients
+        
+        Args:
+            lark_client: LarkClient instance
+            sheets_client: GoogleSheetsClient instance
+            use_playwright: Use Playwright for scraping (default: True)
+        """
         self.lark_client = lark_client
         self.sheets_client = sheets_client
         self.use_playwright = use_playwright and PLAYWRIGHT_AVAILABLE
         
+        # Initialize Playwright crawler if available
         if self.use_playwright:
             try:
                 self.playwright_crawler = TikTokPlaywrightCrawler()
-                logger.info("✅ Optimized Playwright crawler initialized")
+                logger.info("✅ Playwright crawler v3.2 initialized")
             except Exception as e:
-                logger.error(f"❌ Failed to init Playwright crawler: {e}")
+                logger.error(f"❌ Failed to initialize Playwright: {e}")
                 self.playwright_crawler = None
                 self.use_playwright = False
         else:
             self.playwright_crawler = None
         
-        logger.info(f"🔧 Crawler mode: {'Optimized Parallel' if self.use_playwright else 'Fallback only'}")
+        logger.info(f"🔧 Crawler mode: {'Playwright v3.2' if self.use_playwright else 'Lark fallback only'}")
+        
+    def extract_video_id_from_url(self, url: str) -> Optional[str]:
+        """Extract TikTok video ID from URL"""
+        try:
+            if '/video/' in url:
+                video_id = url.split('/video/')[1]
+                if '?' in video_id:
+                    video_id = video_id.split('?')[0]
+                return video_id.strip()
+            
+            logger.warning(f"⚠️ Could not extract video ID from: {url}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Error extracting video ID: {e}")
+            return None
     
     def extract_lark_field_value(self, field_data, field_type: str = 'text'):
-        """Extract value from Lark field"""
+        """
+        Extract value from Lark field (handles different formats)
+        Formats: text, number, link, array, date
+        """
         try:
             if not field_data:
                 return None
             
+            # If it's a list
             if isinstance(field_data, list):
                 if len(field_data) == 0:
                     return None
+                
                 first_item = field_data[0]
+                
+                # List of objects
                 if isinstance(first_item, dict):
                     if field_type == 'text':
                         return str(first_item.get('text', '')).strip()
                     elif field_type == 'number':
+                        text_value = first_item.get('text', '0')
                         try:
-                            return int(first_item.get('text', 0))
-                        except:
+                            return int(text_value)
+                        except (ValueError, TypeError):
                             return 0
-                    return first_item
+                    else:
+                        return first_item
+                # List of primitives
                 else:
                     if field_type == 'number':
                         try:
                             return int(first_item)
-                        except:
+                        except (ValueError, TypeError):
                             return 0
-                    return str(first_item)
+                    else:
+                        return str(first_item)
             
+            # If it's a dictionary (like link field)
             if isinstance(field_data, dict):
                 if field_type == 'link':
-                    return (field_data.get('text') or field_data.get('link') or '').strip()
+                    link_value = field_data.get('text') or field_data.get('link')
+                    return str(link_value).strip() if link_value else None
                 elif field_type == 'text':
                     return str(field_data.get('text', '')).strip()
-                return field_data
+                else:
+                    return field_data
             
+            # If it's a primitive
             if field_type == 'number':
                 try:
                     return int(field_data) if field_data else 0
-                except:
+                except (ValueError, TypeError):
                     return 0
-            return str(field_data).strip() if field_data else None
+            else:
+                return str(field_data).strip() if field_data else None
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Error extracting field value: {e}")
+            return None
+    
+    def extract_publish_date_from_lark(self, field_data) -> Optional[str]:
+        """
+        Extract publish date from Lark field
+        Handles: timestamp (int), date string, text
+        Returns: YYYY-MM-DD format or None
+        """
+        try:
+            if not field_data:
+                return None
+            
+            # If it's a number (timestamp)
+            if isinstance(field_data, (int, float)):
+                if field_data > 0:
+                    ts = field_data / 1000 if field_data > 9999999999 else field_data
+                    dt = datetime.fromtimestamp(ts)
+                    if 2016 <= dt.year <= 2030:
+                        return dt.strftime('%Y-%m-%d')
+                return None
+            
+            # If it's a string
+            if isinstance(field_data, str):
+                field_data = field_data.strip()
+                if not field_data or field_data in ['', 'None', 'null', 'N/A', '-']:
+                    return None
+                
+                # Try parsing as date
+                for fmt in ['%Y-%m-%d', '%d/%m/%Y', '%m/%d/%Y', '%Y/%m/%d']:
+                    try:
+                        dt = datetime.strptime(field_data, fmt)
+                        return dt.strftime('%Y-%m-%d')
+                    except:
+                        continue
+                
+                # Try as timestamp string
+                try:
+                    ts = int(field_data)
+                    ts = ts / 1000 if ts > 9999999999 else ts
+                    dt = datetime.fromtimestamp(ts)
+                    if 2016 <= dt.year <= 2030:
+                        return dt.strftime('%Y-%m-%d')
+                except:
+                    pass
+                
+                return None
+            
+            # If it's a dict (Lark field format)
+            if isinstance(field_data, dict):
+                text_value = field_data.get('text', '')
+                return self.extract_publish_date_from_lark(text_value)
+            
+            # If it's a list
+            if isinstance(field_data, list) and len(field_data) > 0:
+                return self.extract_publish_date_from_lark(field_data[0])
+            
+            return None
             
         except Exception as e:
-            logger.warning(f"⚠️ Error extracting field: {e}")
+            logger.debug(f"Error extracting publish date: {e}")
+            return None
+    
+    def is_recent_video(self, publish_date_str: Optional[str]) -> bool:
+        """
+        Check if a video's publish date is within the crawl window.
+        Returns True if:
+        - publish_date is in current month or previous month
+        - publish_date is None/empty (unknown → needs crawl)
+        Returns False if publish_date is older than previous month.
+        
+        Example: If today is 2026-02-15, window = [2026-01-01, 2026-02-28]
+                 Videos from 2025-12 and earlier → skip
+        """
+        if not publish_date_str:
+            return True  # No date → treat as new, needs crawl
+        
+        try:
+            video_date = datetime.strptime(publish_date_str, '%Y-%m-%d').date()
+            today = date.today()
+            
+            # Calculate first day of previous month
+            if today.month == 1:
+                cutoff = date(today.year - 1, 12, 1)
+            else:
+                cutoff = date(today.year, today.month - 1, 1)
+            
+            return video_date >= cutoff
+        except (ValueError, TypeError):
+            return True  # Invalid date → treat as unknown, needs crawl
+    
+    def process_lark_record(self, lark_record: Dict, tiktok_result: Dict = None) -> Optional[Dict]:
+        """
+        Process Lark record with TikTok crawl result
+        v3.2: Handles publish_date priority and broken links
+        
+        Args:
+            lark_record: Record from Lark Bitable
+            tiktok_result: Result from crawler (optional, if batch crawled)
+            
+        Returns:
+            Dict with processed data or None
+        """
+        try:
+            fields = lark_record.get('fields', {})
+            record_id = lark_record.get('id', '')
+            
+            # Extract Link
+            link_field = fields.get('Link air bài', {})
+            link_value = self.extract_lark_field_value(link_field, 'link')
+            
+            if not link_value:
+                logger.warning(f"⚠️ Record {record_id} has no link, skipping")
+                return None
+            
+            # Extract Current Views from Lark (fallback data)
+            current_views_lark = fields.get('Lượt xem hiện tại', [])
+            views_lark = self.extract_lark_field_value(current_views_lark, 'number')
+            
+            # Extract 24h Baseline from Lark
+            baseline_lark = fields.get('Số view 24h trước', [])
+            baseline_value = self.extract_lark_field_value(baseline_lark, 'number')
+            
+            # 📅 Extract existing Published Date from Lark
+            publish_date_lark_field = fields.get('Published Date', '')
+            publish_date_from_lark = self.extract_publish_date_from_lark(publish_date_lark_field)
+            
+            # Use provided TikTok result or fallback to Lark data
+            if tiktok_result:
+                # v3.2: Check if broken link
+                if tiktok_result.get('is_broken'):
+                    # Broken link - clear all data
+                    logger.warning(f"🔗 Broken link detected: {link_value[:50]}...")
+                    return {
+                        'record_id': record_id,
+                        'link': link_value,
+                        'views': None,  # Will be handled by sheets_client
+                        'baseline': None,
+                        'publish_date': None,  # Clear date for broken link
+                        'status': 'broken',
+                        'is_broken': True,
+                        'source_data': {
+                            'lark_views': views_lark,
+                            'lark_baseline': baseline_value,
+                            'lark_publish_date': publish_date_from_lark,
+                            'tiktok_stats': tiktok_result,
+                            'error': tiktok_result.get('error', '')
+                        }
+                    }
+                
+                if tiktok_result.get('success') and tiktok_result.get('views', 0) > 0:
+                    # Success - use crawled data
+                    current_views = tiktok_result.get('views', views_lark or 0)
+                    
+                    # v3.2: Publish date from crawler already handles priority
+                    publish_date = tiktok_result.get('publish_date') or publish_date_from_lark
+                    
+                    status = 'success'
+                else:
+                    # Failed but not broken - use Lark fallback, preserve date
+                    current_views = views_lark or 0
+                    publish_date = publish_date_from_lark
+                    status = 'partial'
+            else:
+                # No TikTok result - use Lark data only
+                current_views = views_lark or 0
+                publish_date = publish_date_from_lark
+                status = 'partial'
+            
+            # Use Lark baseline
+            baseline = baseline_value if baseline_value else (views_lark or 0)
+            
+            processed_record = {
+                'record_id': record_id,
+                'link': link_value,
+                'views': current_views,
+                'baseline': baseline,
+                'publish_date': publish_date,
+                'status': status,
+                'is_broken': False,
+                'source_data': {
+                    'lark_views': views_lark,
+                    'lark_baseline': baseline_value,
+                    'lark_publish_date': publish_date_from_lark,
+                    'tiktok_stats': tiktok_result
+                }
+            }
+            
+            logger.debug(f"✅ Processed record {record_id}: {current_views:,} views, Published: {publish_date or 'N/A'} (status: {status})")
+            return processed_record
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing Lark record: {e}")
             return None
     
     def crawl_all_videos(self) -> Dict:
         """
-        🚀 OPTIMIZED Main crawler function
-        FIXED: Better error handling
+        Main crawler function v3.2
+        1. Get all active records from Lark
+        2. Extract existing publish_dates for priority handling
+        3. Batch crawl with Playwright
+        4. Process results with broken link detection
+        5. Update/Insert into Google Sheets
+        
+        Returns:
+            Dict with success status and statistics
         """
         try:
-            start_time = datetime.now()
-            logger.info("🚀 Starting OPTIMIZED TikTok crawler...")
+            logger.info("🚀 Starting TikTok crawler v3.2...")
             
             # Step 1: Get records from Lark
             logger.info("📋 Fetching records from Lark Bitable...")
@@ -105,236 +337,316 @@ class TikTokCrawler:
             
             if not lark_records:
                 logger.error("❌ No records found in Lark")
-                return self._error_result("No records found in Lark")
+                return {
+                    'success': False,
+                    'message': 'No records found in Lark',
+                    'stats': {
+                        'total': 0, 'processed': 0, 'updated': 0,
+                        'inserted': 0, 'failed': 0, 'broken': 0
+                    }
+                }
             
             logger.info(f"✅ Fetched {len(lark_records)} records from Lark")
             
-            # Step 2: Extract URLs
-            logger.info("🔗 Extracting URLs from records...")
-            url_to_record = {}
-            urls_to_crawl = []
+            # Step 2: Build URL list and existing_dates map
+            urls = []
+            existing_dates = {}
+            record_by_url = {}
             
-            for lark_record in lark_records:
-                fields = lark_record.get('fields', {})
-                record_id = lark_record.get('id', '')
+            for record in lark_records:
+                fields = record.get('fields', {})
+                record_id = record.get('id', '')
                 
+                # Extract link
                 link_field = fields.get('Link air bài', {})
                 link_value = self.extract_lark_field_value(link_field, 'link')
                 
-                if link_value:
-                    urls_to_crawl.append(link_value)
-                    url_to_record[link_value] = lark_record
-            
-            logger.info(f"🔗 Found {len(urls_to_crawl)} URLs to crawl")
-            
-            if not urls_to_crawl:
-                return self._error_result("No valid URLs found")
-            
-            # Step 3: BATCH CRAWL
-            logger.info(f"⚡ Starting parallel crawl of {len(urls_to_crawl)} URLs...")
-            
-            crawl_results = []
-            
-            if self.use_playwright and self.playwright_crawler:
-                try:
-                    logger.info("🎯 Using Playwright batch crawler...")
-                    crawl_results = self.playwright_crawler.crawl_batch_sync(urls_to_crawl)
-                    logger.info(f"✅ Playwright returned {len(crawl_results)} results")
-                except Exception as e:
-                    logger.error(f"❌ Playwright crawl failed: {e}", exc_info=True)
-                    crawl_results = []
-            
-            # If Playwright failed or returned empty, create empty results
-            if not crawl_results:
-                logger.warning("⚠️ No crawl results, using Lark data only")
-                crawl_results = [{'url': url, 'success': False} for url in urls_to_crawl]
-            
-            # Build results lookup
-            results_by_url = {}
-            for r in crawl_results:
-                if r and r.get('url'):
-                    results_by_url[r['url']] = r
-            
-            logger.info(f"📊 Processing {len(results_by_url)} crawl results...")
-            
-            # Step 4: Process results
-            processed_records = []
-            success_count = 0
-            partial_count = 0
-            failed_count = 0
-            
-            for url, lark_record in url_to_record.items():
-                crawl_result = results_by_url.get(url, {})
-                fields = lark_record.get('fields', {})
-                record_id = lark_record.get('id', '')
+                if not link_value:
+                    continue
                 
-                views_lark = self.extract_lark_field_value(
-                    fields.get('Lượt xem hiện tại', []), 'number'
-                )
-                baseline_lark = self.extract_lark_field_value(
-                    fields.get('Số view 24h trước', []), 'number'
-                )
+                # Extract existing publish_date
+                publish_date_field = fields.get('Published Date', '')
+                existing_date = self.extract_publish_date_from_lark(publish_date_field)
                 
-                if crawl_result.get('success'):
-                    current_views = crawl_result.get('views', views_lark or 0)
-                    publish_date = crawl_result.get('publish_date', '')
-                    status = 'success'
-                    success_count += 1
-                else:
-                    current_views = views_lark or 0
-                    publish_date = ''
-                    status = 'partial' if views_lark else 'failed'
-                    if views_lark:
-                        partial_count += 1
-                    else:
-                        failed_count += 1
-                
-                baseline = baseline_lark or views_lark or 0
-                
-                processed_records.append({
-                    'record_id': record_id,
-                    'link': url,
-                    'views': current_views,
-                    'baseline': baseline,
-                    'publish_date': publish_date,
-                    'status': status,
-                })
+                urls.append(link_value)
+                existing_dates[link_value] = existing_date or ''
+                record_by_url[link_value] = record
             
-            logger.info(f"✅ Processed: {success_count} success, {partial_count} partial, {failed_count} failed")
+            # Log existing dates stats from Lark
+            valid_dates_lark = sum(1 for d in existing_dates.values() if d)
+            logger.info(f"📅 Existing valid dates from Lark: {valid_dates_lark}/{len(urls)}")
             
-            # Step 5: Batch update to Sheets
-            logger.info("📊 Updating Google Sheets...")
+            # Step 2.5: Merge dates from Google Sheets (where crawled dates are actually stored)
+            # Lark may not have Published Date, but Sheets does from previous crawl runs
             try:
-                updated, inserted = self.sheets_client.batch_update_records(processed_records)
-                logger.info(f"✅ Sheets updated: {updated} updated, {inserted} inserted")
+                sheets_dates = self.sheets_client.get_publish_dates_by_link()
+                merged_count = 0
+                for url in urls:
+                    if not existing_dates.get(url) and url in sheets_dates:
+                        existing_dates[url] = sheets_dates[url]
+                        merged_count += 1
+                if merged_count > 0:
+                    logger.info(f"📅 Merged {merged_count} dates from Google Sheets")
             except Exception as e:
-                logger.error(f"❌ Sheets update failed: {e}")
-                updated, inserted = 0, 0
+                logger.warning(f"⚠️ Could not read dates from Sheets: {e}")
             
-            # Calculate duration
-            duration = (datetime.now() - start_time).total_seconds()
+            valid_dates_total = sum(1 for d in existing_dates.values() if d)
+            logger.info(f"📅 Total valid dates (Lark + Sheets): {valid_dates_total}/{len(urls)}")
+            
+            # Step 3: Filter - only crawl recent videos (current & previous month)
+            all_urls = urls[:]  # Keep original list for reference
+            urls_to_crawl = []
+            skipped_old = 0
+            
+            for url in all_urls:
+                existing_date = existing_dates.get(url, '')
+                if self.is_recent_video(existing_date):
+                    urls_to_crawl.append(url)
+                else:
+                    skipped_old += 1
+            
+            if skipped_old > 0:
+                today = date.today()
+                if today.month == 1:
+                    cutoff_str = f"{today.year - 1}-12"
+                else:
+                    cutoff_str = f"{today.year}-{today.month - 1:02d}"
+                logger.info(f"📅 Date filter: crawling {len(urls_to_crawl)} recent videos (>= {cutoff_str}), skipping {skipped_old} old videos")
+            
+            # Step 4: Batch crawl with Playwright + incremental Sheets write
+            # Process in batches of INCREMENTAL_BATCH_SIZE to save dates progressively
+            # If process is killed mid-run, dates from completed batches are already saved
+            INCREMENTAL_BATCH_SIZE = 100
+            total_to_crawl = len(urls_to_crawl)
+            logger.info(f"🔄 Starting incremental batch crawl v3.2 ({total_to_crawl} videos, batch size {INCREMENTAL_BATCH_SIZE})...")
+            
+            all_processed = []
+            total_updated = 0
+            total_inserted = 0
+            total_failed = 0
+            total_broken = 0
+            
+            for batch_start in range(0, total_to_crawl, INCREMENTAL_BATCH_SIZE):
+                batch_urls = urls_to_crawl[batch_start:batch_start + INCREMENTAL_BATCH_SIZE]
+                batch_num = batch_start // INCREMENTAL_BATCH_SIZE + 1
+                total_batches = (total_to_crawl + INCREMENTAL_BATCH_SIZE - 1) // INCREMENTAL_BATCH_SIZE
+                
+                logger.info(f"📦 Batch {batch_num}/{total_batches}: crawling {len(batch_urls)} videos (total progress: {batch_start}/{total_to_crawl})...")
+                
+                # Crawl this batch
+                crawl_results = {}
+                if self.use_playwright and self.playwright_crawler:
+                    try:
+                        results_list = self.playwright_crawler.crawl_batch_sync(batch_urls, existing_dates=existing_dates)
+                        for result in results_list:
+                            url = result.get('url', '')
+                            if url:
+                                crawl_results[url] = result
+                    except Exception as e:
+                        logger.error(f"❌ Batch {batch_num} crawl error: {e}")
+                
+                # Process records for this batch
+                batch_processed = []
+                batch_failed = 0
+                batch_broken = 0
+                
+                for url in batch_urls:
+                    try:
+                        record = record_by_url.get(url)
+                        if not record:
+                            continue
+                        
+                        tiktok_result = crawl_results.get(url)
+                        processed = self.process_lark_record(record, tiktok_result)
+                        
+                        if processed:
+                            batch_processed.append(processed)
+                            if processed.get('is_broken'):
+                                batch_broken += 1
+                            elif processed.get('status') != 'success':
+                                batch_failed += 1
+                        else:
+                            batch_failed += 1
+                    except Exception as e:
+                        logger.error(f"❌ Error processing record: {e}")
+                        batch_failed += 1
+                
+                # Write this batch to Sheets immediately (saves dates!)
+                if batch_processed:
+                    try:
+                        updated, inserted = self.sheets_client.batch_update_records(batch_processed)
+                        total_updated += updated
+                        total_inserted += inserted
+                        logger.info(f"✅ Batch {batch_num} saved: {updated} updated, {inserted} inserted")
+                    except Exception as e:
+                        logger.error(f"❌ Batch {batch_num} Sheets write error: {e}")
+                
+                all_processed.extend(batch_processed)
+                total_failed += batch_failed
+                total_broken += batch_broken
+                
+                logger.info(f"📊 Progress: {min(batch_start + len(batch_urls), total_to_crawl)}/{total_to_crawl} crawled, {len(all_processed)} processed, {total_failed} failed, {total_broken} broken")
+            
+            # Final summary
+            success_count = sum(1 for r in all_processed if r.get('status') == 'success')
             
             result = {
                 'success': True,
-                'message': 'Optimized crawler completed successfully',
-                'duration_seconds': duration,
-                'duration_minutes': duration / 60,
+                'message': 'Crawler v3.2 completed successfully',
                 'stats': {
                     'total': len(lark_records),
-                    'urls_crawled': len(urls_to_crawl),
+                    'crawled': total_to_crawl,
+                    'skipped_old': skipped_old,
+                    'processed': len(all_processed),
                     'success': success_count,
-                    'partial': partial_count,
-                    'failed': failed_count,
-                    'updated': updated,
-                    'inserted': inserted,
-                    'speed_per_video': duration / len(urls_to_crawl) if urls_to_crawl else 0,
+                    'updated': total_updated,
+                    'inserted': total_inserted,
+                    'failed': total_failed,
+                    'broken': total_broken
                 }
             }
             
-            logger.info(f"""
-╔══════════════════════════════════════════════════════════════════╗
-║                    🎉 CRAWLER COMPLETE                            ║
-╠══════════════════════════════════════════════════════════════════╣
-║  Total records: {len(lark_records):>5}                                         ║
-║  Crawled: {success_count:>5} success | {partial_count:>4} partial | {failed_count:>4} failed         ║
-║  Sheets: {updated:>5} updated | {inserted:>4} inserted                        ║
-║  Duration: {duration/60:.1f} minutes ({duration:.0f} seconds)                    ║
-║  Speed: {duration/len(urls_to_crawl):.2f}s per video                                  ║
-╚══════════════════════════════════════════════════════════════════╝
-            """)
-            
+            logger.info(f"✅ Crawler v3.2 completed: {result['stats']}")
+            logger.info(f"📅 Summary: {total_to_crawl} recent crawled, {skipped_old} old skipped")
             return result
             
         except Exception as e:
-            logger.error(f"❌ Crawler failed: {e}", exc_info=True)
-            return self._error_result(str(e))
+            logger.error(f"❌ Crawler failed: {e}")
+            return {
+                'success': False,
+                'message': str(e),
+                'stats': {
+                    'total': 0, 'processed': 0, 'updated': 0,
+                    'inserted': 0, 'failed': 0, 'broken': 0
+                }
+            }
     
     def crawl_videos_batch(self, record_ids: List[str] = None) -> Dict:
-        """Crawl specific videos by Record IDs"""
+        """
+        Crawl specific videos by Record IDs (optional)
+        If record_ids is None, crawl all
+        """
         try:
-            logger.info("🚀 Starting batch crawler...")
+            logger.info("🚀 Starting batch crawler v3.2...")
             
+            # Get all records
             all_records = self.lark_client.get_all_active_records()
             
+            # Filter if specific IDs provided
             if record_ids:
                 lark_records = [r for r in all_records if r.get('id') in record_ids]
                 logger.info(f"🔍 Filtered to {len(lark_records)} records")
             else:
                 lark_records = all_records
             
-            urls_to_crawl = []
-            url_to_record = {}
+            # Build URL list and existing_dates
+            urls = []
+            existing_dates = {}
+            record_by_url = {}
             
             for record in lark_records:
                 fields = record.get('fields', {})
-                link = self.extract_lark_field_value(fields.get('Link air bài', {}), 'link')
-                if link:
-                    urls_to_crawl.append(link)
-                    url_to_record[link] = record
+                link_field = fields.get('Link air bài', {})
+                link_value = self.extract_lark_field_value(link_field, 'link')
+                
+                if not link_value:
+                    continue
+                
+                publish_date_field = fields.get('Published Date', '')
+                existing_date = self.extract_publish_date_from_lark(publish_date_field)
+                
+                urls.append(link_value)
+                existing_dates[link_value] = existing_date or ''
+                record_by_url[link_value] = record
             
-            crawl_results = []
+            # Merge dates from Google Sheets (where crawled dates are actually stored)
+            try:
+                sheets_dates = self.sheets_client.get_publish_dates_by_link()
+                for url in urls:
+                    if not existing_dates.get(url) and url in sheets_dates:
+                        existing_dates[url] = sheets_dates[url]
+            except Exception as e:
+                logger.warning(f"⚠️ Could not read dates from Sheets: {e}")
+            
+            # Filter: only crawl recent videos (current & previous month)
+            urls_to_crawl = []
+            skipped_old = 0
+            
+            for url in urls:
+                existing_date = existing_dates.get(url, '')
+                if self.is_recent_video(existing_date):
+                    urls_to_crawl.append(url)
+                else:
+                    skipped_old += 1
+            
+            if skipped_old > 0:
+                logger.info(f"📅 Date filter: crawling {len(urls_to_crawl)} recent, skipping {skipped_old} old videos")
+            
+            # Batch crawl (only recent videos)
+            crawl_results = {}
             if self.use_playwright and self.playwright_crawler:
-                try:
-                    crawl_results = self.playwright_crawler.crawl_batch_sync(urls_to_crawl)
-                except Exception as e:
-                    logger.error(f"❌ Batch crawl failed: {e}")
+                results_list = self.playwright_crawler.crawl_batch_sync(urls_to_crawl, existing_dates=existing_dates)
+                for result in results_list:
+                    url = result.get('url', '')
+                    if url:
+                        crawl_results[url] = result
             
-            results_by_url = {r['url']: r for r in crawl_results if r}
-            
+            # Process results (only recent videos)
             processed_records = []
-            for url, record in url_to_record.items():
-                result = results_by_url.get(url, {})
-                fields = record.get('fields', {})
+            for url in urls_to_crawl:
+                record = record_by_url.get(url)
+                if not record:
+                    continue
                 
-                views_lark = self.extract_lark_field_value(
-                    fields.get('Lượt xem hiện tại', []), 'number'
-                )
-                baseline_lark = self.extract_lark_field_value(
-                    fields.get('Số view 24h trước', []), 'number'
-                )
-                
-                processed_records.append({
-                    'record_id': record.get('id', ''),
-                    'link': url,
-                    'views': result.get('views', views_lark or 0),
-                    'baseline': baseline_lark or views_lark or 0,
-                    'publish_date': result.get('publish_date', ''),
-                    'status': 'success' if result.get('success') else 'partial',
-                })
+                tiktok_result = crawl_results.get(url)
+                processed = self.process_lark_record(record, tiktok_result)
+                if processed:
+                    processed_records.append(processed)
             
+            # Update sheets
             updated, inserted = self.sheets_client.batch_update_records(processed_records)
             
             return {
                 'success': True,
-                'message': 'Batch crawl completed',
+                'message': 'Batch crawl v3.2 completed',
                 'stats': {
                     'total': len(lark_records),
+                    'crawled': len(urls_to_crawl),
+                    'skipped_old': skipped_old,
                     'processed': len(processed_records),
                     'updated': updated,
-                    'inserted': inserted,
+                    'inserted': inserted
                 }
             }
             
         except Exception as e:
             logger.error(f"❌ Batch crawl failed: {e}")
-            return self._error_result(str(e))
-    
-    def _error_result(self, message: str) -> Dict:
-        """Return error result dict"""
-        return {
-            'success': False,
-            'message': message,
-            'stats': {
-                'total': 0,
-                'processed': 0,
-                'updated': 0,
-                'inserted': 0,
-                'failed': 0,
+            return {
+                'success': False, 
+                'message': str(e),
+                'stats': {
+                    'total': 0, 'processed': 0, 'updated': 0, 'inserted': 0
+                }
             }
-        }
     
+    # Legacy method for single video (kept for compatibility)
     def get_tiktok_views(self, video_url: str) -> Optional[Dict]:
-        """Get single video stats (backward compatibility)"""
+        """Get TikTok video stats using Playwright"""
         if self.use_playwright and self.playwright_crawler:
-            return self.playwright_crawler.get_tiktok_views(video_url)
-        return None
+            try:
+                logger.debug(f"🔍 Crawling with Playwright: {video_url}")
+                stats = self.playwright_crawler.get_tiktok_views(video_url)
+                
+                if stats and stats.get('views', 0) > 0:
+                    logger.debug(f"✅ Got TikTok stats: {stats['views']:,} views")
+                    return stats
+                else:
+                    logger.warning(f"⚠️ Playwright returned no stats")
+                    return None
+                    
+            except Exception as e:
+                logger.error(f"❌ Playwright error: {e}")
+                return None
+        else:
+            logger.debug(f"⚠️ Playwright not available")
+            return None
